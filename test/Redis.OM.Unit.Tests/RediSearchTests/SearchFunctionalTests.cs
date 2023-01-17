@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.VisualBasic;
@@ -30,7 +31,7 @@ namespace Redis.OM.Unit.Tests.RediSearchTests
             var names = new[] { "Steve", "Sarah", "Chris", "Theresa", "Frank", "Mary", "John", "Alice", "Bob" };
             var rand = new Random();
             var tasks = new List<Task>();
-            for (var i = 0; i < 500; i++)
+            for (var i = 0; i < 50; i++)
             {
                 var person = new HashPerson()
                 {
@@ -54,7 +55,7 @@ namespace Redis.OM.Unit.Tests.RediSearchTests
             var names = new[] { "Steve", "Sarah", "Chris", "Theresa", "Frank", "Mary", "John", "Alice", "Bob" };
             var rand = new Random();
             var tasks = new List<Task>();
-            for (var i = 0; i < 500; i++)
+            for (var i = 0; i < 50; i++)
             {
                 var person = new Person
                 {
@@ -694,6 +695,31 @@ namespace Redis.OM.Unit.Tests.RediSearchTests
         }
 
         [Fact]
+        public async Task FindByIdsAsyncIdsWithDuplicatedIds()
+        {
+            var person1 = new Person() {Name = "Alice", Age = 51};
+            var person2 = new Person() {Name = "Bob", Age = 37};
+
+            var collection = new RedisCollection<Person>(_connection);
+
+            await collection.InsertAsync(person1);
+            await collection.InsertAsync(person2);
+
+            var ids = new string[] {person1.Id, person2.Id, person1.Id, person2.Id};
+
+            var people = await collection.FindByIdsAsync(ids);
+            Assert.NotNull(people[ids[0]]);
+            Assert.Equal(ids[0], people[ids[0]].Id);
+            Assert.Equal("Alice", people[ids[0]].Name);
+            Assert.Equal(51, people[ids[0]].Age);
+
+            Assert.NotNull(people[ids[1]]);
+            Assert.Equal(ids[1], people[ids[1]].Id);
+            Assert.Equal("Bob", people[ids[1]].Name);
+            Assert.Equal(37, people[ids[1]].Age);
+        }
+
+        [Fact]
         public async Task FindByIdsAsyncKeys()
         {
             var person1 = new Person() {Name = "Alice", Age = 51};
@@ -812,6 +838,22 @@ namespace Redis.OM.Unit.Tests.RediSearchTests
         }
 
         [Fact]
+        public async Task TestMultipleContainsGuid()
+        {
+            var collection = new RedisCollection<ObjectWithStringLikeValueTypes>(_connection);
+            var objectList = Enumerable.Range(1, 10).Select(x => new ObjectWithStringLikeValueTypes() { Guid = Guid.NewGuid() }).ToList();
+            foreach (var item in objectList)
+            {
+                await collection.InsertAsync(item);
+            }
+
+            var ids = objectList.Select(x => x.Guid);
+            var objects = await collection.Where(x => ids.Contains(x.Guid)).ToListAsync();
+
+            Assert.Equal(ids, objects.Select(x => x.Guid));
+        }
+
+        [Fact]
         public async Task TestShouldFailForSave()
         {
             var expectedText = "The RedisCollection has been instructed to not maintain the state of records enumerated by " +
@@ -832,6 +874,91 @@ namespace Redis.OM.Unit.Tests.RediSearchTests
             Assert.True(res.Count >= 1);
             Assert.Equal(0,collection.StateManager.Data.Count);
             Assert.Equal(0,collection.StateManager.Snapshot.Count);
+        }
+
+
+        [Fact]
+        public async Task TestFlagEnumQuery()
+        {
+            var collection = new RedisCollection<ObjectWithStringLikeValueTypes>(_connection, false, 10000);
+            var obj = new ObjectWithStringLikeValueTypes { Flags = EnumFlags.One | EnumFlags.Two };
+            await collection.InsertAsync(obj);
+            var res = await collection.FirstOrDefaultAsync(x => x.Flags == EnumFlags.One);
+            Assert.NotNull(res);
+        }
+
+        public void CompareTimestamps(DateTime ts1, DateTime ts2)
+        {
+            Assert.Equal(ts1.ToString("yyyy-MM-ddTHH\\:mm\\:ss.fff", CultureInfo.InvariantCulture), ts2.ToString("yyyy-MM-ddTHH\\:mm\\:ss.fff", CultureInfo.InvariantCulture));
+        }
+
+        [Fact]
+        public async Task TestTimeStampRanges()
+        {
+            var collection = new RedisCollection<ObjectWithDateTime>(_connection, false, 10000);
+            var timestamp = DateTime.Now;
+            var greaterThanTimestamp = DateTime.Now.Subtract(TimeSpan.FromHours(1));
+            var unixTimestamp = new DateTimeOffset(timestamp).ToUnixTimeMilliseconds();
+            var obj = new ObjectWithDateTime { Timestamp = timestamp, NullableTimestamp = timestamp };
+            var id = await collection.InsertAsync(obj);
+            var first = await collection.FirstOrDefaultAsync(x => x.Timestamp > greaterThanTimestamp);
+            Assert.NotNull(first);
+            Assert.NotNull(first.NullableTimestamp);
+            CompareTimestamps(timestamp, first.Timestamp);
+            CompareTimestamps(timestamp, first.NullableTimestamp.Value);
+            Assert.Equal(obj.Id, first.Id);
+        }
+
+        [Fact]
+        public async Task TestTimeStampRangesHash()
+        {
+            var collection = new RedisCollection<ObjectWithDateTimeHash>(_connection, false, 10000);
+            var timestamp = DateTime.Now;
+            var greaterThanTimestamp = DateTime.Now.Subtract(TimeSpan.FromHours(1));
+            var unixTimestamp = new DateTimeOffset(timestamp).ToUnixTimeMilliseconds();
+            var obj = new ObjectWithDateTimeHash { Timestamp = timestamp, NullableTimestamp = timestamp };
+            var id = await collection.InsertAsync(obj);
+            var first = await collection.FirstOrDefaultAsync(x => x.Timestamp > greaterThanTimestamp);
+            Assert.NotNull(first);
+            Assert.NotNull(first.NullableTimestamp);
+            CompareTimestamps(timestamp, first.Timestamp);
+            CompareTimestamps(timestamp, first.NullableTimestamp.Value);
+            Assert.Equal(obj.Id, first.Id);
+        }
+
+        [Fact]
+        public async Task TestListContains()
+        {
+            var collection = new RedisCollection<Person>(_connection);
+            var person1 = new Person() { Name = "Ferb", Age = 14, NickNames = new[] { "Feb", "Fee" } };
+            var person2 = new Person() { Name = "Phineas", Age = 14, NickNames = new[] { "Phineas", "Triangle Head", "Phine" } };
+
+            await collection.InsertAsync(person1);
+            await collection.InsertAsync(person2);
+
+            var names = new List<string> { "Ferb", "Phineas" };
+            var people = await collection.Where(x => names.Contains(x.Name)).ToListAsync();
+
+            Assert.Contains(people, x => x.Id == person1.Id);
+            Assert.Contains(people, x => x.Id == person2.Id);
+        }
+
+        [Fact]
+        public async Task TestListMultipleContains()
+        {
+            var collection = new RedisCollection<Person>(_connection);
+            var person1 = new Person() { Name = "Ferb", Age = 14, NickNames = new[] { "Feb", "Fee" }, TagField = "Ferb"  };
+            var person2 = new Person() { Name = "Phineas", Age = 14, NickNames = new[] { "Phineas", "Triangle Head", "Phine" }, TagField = "Phineas" };
+
+            await collection.InsertAsync(person1);
+            await collection.InsertAsync(person2);
+
+            var names = new List<string> { "Ferb", "Phineas" };
+            var ages = new List<int?> { 14, 50, 60 };
+            var people = await collection.Where(x => names.Contains(x.Name) && names.Contains(x.TagField) && ages.Contains(x.Age)).ToListAsync();
+
+            Assert.Contains(people, x => x.Id == person1.Id);
+            Assert.Contains(people, x => x.Id == person2.Id);
         }
     }
 }

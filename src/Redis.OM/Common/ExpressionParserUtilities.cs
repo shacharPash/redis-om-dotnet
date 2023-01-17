@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Redis.OM.Aggregation;
 using Redis.OM.Aggregation.AggregationPredicates;
@@ -35,7 +38,7 @@ namespace Redis.OM.Common
         {
             return exp switch
             {
-                ConstantExpression constExp => constExp.Value.ToString(),
+                ConstantExpression constExp => ValueToString(constExp.Value),
                 MemberExpression member => GetOperandStringForMember(member),
                 MethodCallExpression method when method.Method.Name == "get_Item" =>
                     $"@{((ConstantExpression)method.Arguments[0]).Value}",
@@ -69,16 +72,17 @@ namespace Redis.OM.Common
         /// Gets the operand string from a search.
         /// </summary>
         /// <param name="exp">expression.</param>
+        /// <param name="treatEnumsAsInt">Treat enum as an integer.</param>
         /// <returns>the operand string.</returns>
         /// <exception cref="ArgumentException">thrown if expression is un-parseable.</exception>
-        internal static string GetOperandStringForQueryArgs(Expression exp)
+        internal static string GetOperandStringForQueryArgs(Expression exp, bool treatEnumsAsInt = false)
         {
             return exp switch
             {
                 ConstantExpression constExp => $"{constExp.Value}",
-                MemberExpression member => GetOperandStringForMember(member),
+                MemberExpression member => GetOperandStringForMember(member, treatEnumsAsInt),
                 MethodCallExpression method => TranslateMethodStandardQuerySyntax(method),
-                UnaryExpression unary => GetOperandStringForQueryArgs(unary.Operand),
+                UnaryExpression unary => GetOperandStringForQueryArgs(unary.Operand, treatEnumsAsInt),
                 _ => throw new ArgumentException("Unrecognized Expression type")
             };
         }
@@ -265,7 +269,7 @@ namespace Redis.OM.Common
             return sb.ToString();
         }
 
-        private static string GetOperandStringForMember(MemberExpression member)
+        private static string GetOperandStringForMember(MemberExpression member, bool treatEnumsAsInt = false)
         {
             var memberPath = new List<string>();
             var parentExpression = member.Expression;
@@ -290,15 +294,28 @@ namespace Redis.OM.Common
             if (dependencyChain.Last().Expression is ConstantExpression c)
             {
                 var resolved = c.Value;
+
                 for (var i = dependencyChain.Count; i > 0; i--)
                 {
                     var expr = dependencyChain[i - 1];
                     resolved = GetValue(expr.Member, resolved);
                 }
 
+                var resolvedType = resolved.GetType();
+
                 if (resolved is IEnumerable<string> strings)
                 {
                     return string.Join("|", strings);
+                }
+
+                if (resolved is IEnumerable<Guid> guids)
+                {
+                    return string.Join("|", guids);
+                }
+
+                if (resolved is IEnumerable<Ulid> ulids)
+                {
+                    return string.Join("|", ulids);
                 }
 
                 if (resolved is IEnumerable<int?> ints)
@@ -314,7 +331,44 @@ namespace Redis.OM.Common
                     return sb.ToString();
                 }
 
-                return resolved.ToString();
+                if (resolvedType.IsArray || resolvedType.GetInterfaces().Contains(typeof(IEnumerable)))
+                {
+                    var asEnumerable = (IEnumerable)resolved;
+                    var elementType = resolvedType.GetElementType();
+                    if (elementType == null)
+                    {
+                        elementType = resolvedType.GenericTypeArguments.FirstOrDefault();
+                    }
+
+                    if (elementType != null && elementType.IsEnum)
+                    {
+                        if (treatEnumsAsInt)
+                        {
+                            var sb = new StringBuilder();
+                            sb.Append('|');
+                            foreach (var item in asEnumerable)
+                            {
+                                var asInt = (int)item;
+                                sb.Append($"[{asInt} {asInt}]|");
+                            }
+
+                            sb.Remove(sb.Length - 1, 1);
+                            return sb.ToString();
+                        }
+                        else
+                        {
+                            var strs = new List<string>();
+                            foreach (var item in asEnumerable)
+                            {
+                                strs.Add(item.ToString());
+                            }
+
+                            return string.Join("|", strs);
+                        }
+                    }
+                }
+
+                return ValueToString(resolved);
             }
 
             if (searchField != null)
@@ -331,9 +385,7 @@ namespace Redis.OM.Common
         {
             return exp switch
             {
-                ConstantExpression constExp => constExp.Type == typeof(string)
-                    ? $"\"{constExp.Value}\""
-                    : $"{constExp.Value}",
+                ConstantExpression constExp => GetConstantStringForArgs(constExp),
                 MemberExpression member => GetOperandStringForMember(member),
                 MethodCallExpression method => $"@{((ConstantExpression)method.Arguments[0]).Value}",
                 UnaryExpression unary => GetOperandString(unary.Operand),
@@ -508,7 +560,7 @@ namespace Redis.OM.Common
                         {
                             if (item is ConstantExpression constant)
                             {
-                                innerArgList.Add(constant.Value.ToString());
+                                innerArgList.Add(GetConstantStringForArgs(constant));
                             }
                         }
 
@@ -589,20 +641,28 @@ namespace Redis.OM.Common
             Type type;
             string memberName;
             string literal;
-            if (exp.Object is MemberExpression)
-            {
-                expression = exp.Object as MemberExpression;
-            }
-            else if (exp.Arguments.LastOrDefault() is MemberExpression &&
-                     exp.Arguments.FirstOrDefault() is MemberExpression)
+            if (exp.Arguments.LastOrDefault() is MemberExpression && exp.Arguments.FirstOrDefault() is MemberExpression)
             {
                 var propertyExpression = (MemberExpression)exp.Arguments.Last();
                 var valuesExpression = (MemberExpression)exp.Arguments.First();
                 literal = GetOperandStringForQueryArgs(propertyExpression);
                 if (!literal.StartsWith("@"))
                 {
+                    if (exp.Arguments.Count == 1 && exp.Object != null)
+                    {
+                        propertyExpression = (MemberExpression)exp.Object;
+                        valuesExpression = (MemberExpression)exp.Arguments.Single();
+                    }
+                    else
+                    {
+                        propertyExpression = (MemberExpression)exp.Arguments.First();
+                        valuesExpression = (MemberExpression)exp.Arguments.Last();
+                    }
+                }
+                else if (propertyExpression == valuesExpression)
+                {
                     propertyExpression = (MemberExpression)exp.Arguments.First();
-                    valuesExpression = (MemberExpression)exp.Arguments.Last();
+                    valuesExpression = (MemberExpression)exp.Object;
                 }
 
                 var attribute = DetermineSearchAttribute(propertyExpression);
@@ -622,9 +682,10 @@ namespace Redis.OM.Common
 
                 type = Nullable.GetUnderlyingType(propertyExpression.Type) ?? propertyExpression.Type;
                 memberName = GetOperandStringForMember(propertyExpression);
-                literal = GetOperandStringForQueryArgs(valuesExpression);
+                var treatEnumsAsInts = type.IsEnum && !(propertyExpression.Member.GetCustomAttributes(typeof(JsonConverterAttribute)).FirstOrDefault() is JsonConverterAttribute converter && converter.ConverterType == typeof(JsonStringEnumConverter));
+                literal = GetOperandStringForQueryArgs(valuesExpression, treatEnumsAsInts);
 
-                if ((type == typeof(string) || type == typeof(string[]) || type == typeof(List<string>)) && attribute is IndexedAttribute)
+                if ((type == typeof(string) || type == typeof(string[]) || type == typeof(List<string>) || type == typeof(Guid) || type == typeof(Ulid) || (type.IsEnum && !treatEnumsAsInts)) && attribute is IndexedAttribute)
                 {
                     return $"({memberName}:{{{EscapeTagField(literal).Replace("\\|", "|")}}})";
                 }
@@ -639,6 +700,11 @@ namespace Redis.OM.Common
                 ret = ret.Substring(0, ret.Length - 1);
 
                 return ret;
+            }
+
+            if (exp.Object is MemberExpression)
+            {
+                expression = exp.Object as MemberExpression;
             }
             else if (exp.Arguments.FirstOrDefault() is MemberExpression)
             {
@@ -663,6 +729,35 @@ namespace Redis.OM.Common
             var lambda = (LambdaExpression)exp.Arguments.Last();
             var tempQuery = ExpressionTranslator.TranslateBinaryExpression((BinaryExpression)lambda.Body);
             return tempQuery.Replace("@", $"{prefix}_");
+        }
+
+        private static string ValueToString(object value)
+        {
+            Type valueType = value.GetType();
+
+            if (valueType == typeof(double) || Nullable.GetUnderlyingType(valueType) == typeof(double))
+            {
+                return ((double)value).ToString(CultureInfo.InvariantCulture);
+            }
+
+            if (value is DateTime dt)
+            {
+                return new DateTimeOffset(dt).ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+            }
+
+            return value.ToString();
+        }
+
+        private static string GetConstantStringForArgs(ConstantExpression constExp)
+        {
+            string valueAsString = ValueToString(constExp.Value);
+
+            if (constExp.Type == typeof(string))
+            {
+                return $"\"{valueAsString}\"";
+            }
+
+            return $"{valueAsString}";
         }
     }
 }

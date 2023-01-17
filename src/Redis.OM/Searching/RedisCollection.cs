@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Redis.OM.Common;
@@ -55,7 +56,7 @@ namespace Redis.OM.Searching
             _connection = connection;
             SaveState = saveState;
             StateManager = new RedisCollectionStateManager(rootAttribute);
-            Initialize(new RedisQueryProvider(connection, StateManager, rootAttribute, ChunkSize), null, null);
+            Initialize(new RedisQueryProvider(connection, StateManager, rootAttribute, ChunkSize, SaveState), null, null);
         }
 
         /// <summary>
@@ -113,6 +114,14 @@ namespace Redis.OM.Searching
             }
         }
 
+        /// <inheritdoc />
+        public bool Any()
+        {
+            var query = ExpressionTranslator.BuildQueryFromExpression(Expression, typeof(T), BooleanExpression);
+            query.Limit = new SearchLimit { Number = 0, Offset = 0 };
+            return (int)_connection.Search<T>(query).DocumentCount > 0;
+        }
+
         /// <summary>
         /// Checks to see if anything matching the expression exists.
         /// </summary>
@@ -152,8 +161,7 @@ namespace Redis.OM.Searching
                 _connection.UnlinkAndSet(key, item, StateManager.DocumentAttribute.StorageType);
             }
 
-            StateManager.InsertIntoSnapshot(key, item);
-            StateManager.InsertIntoData(key, item);
+            SaveToStateManager(key, item);
         }
 
         /// <inheritdoc />
@@ -181,8 +189,15 @@ namespace Redis.OM.Searching
                 await _connection.UnlinkAndSetAsync(key, item, StateManager.DocumentAttribute.StorageType);
             }
 
-            StateManager.InsertIntoSnapshot(key, item);
-            StateManager.InsertIntoData(key, item);
+            SaveToStateManager(key, item);
+        }
+
+        /// <inheritdoc />
+        public async ValueTask UpdateAsync(IEnumerable<T> items)
+        {
+            var tasks = items.Select(UpdateAsync);
+
+            await Task.WhenAll(tasks);
         }
 
         /// <inheritdoc />
@@ -194,11 +209,45 @@ namespace Redis.OM.Searching
         }
 
         /// <inheritdoc />
+        public void Delete(IEnumerable<T> items)
+        {
+            var keys = items.Select(x => x.GetKey()).ToArray();
+            if (!keys.Any())
+            {
+                return;
+            }
+
+            foreach (var key in keys)
+            {
+                StateManager.Remove(key);
+            }
+
+            _connection.Unlink(keys);
+        }
+
+        /// <inheritdoc />
         public async Task DeleteAsync(T item)
         {
             var key = item.GetKey();
             await _connection.UnlinkAsync(key);
             StateManager.Remove(key);
+        }
+
+        /// <inheritdoc />
+        public async Task DeleteAsync(IEnumerable<T> items)
+        {
+            var keys = items.Select(x => x.GetKey()).ToArray();
+            if (!keys.Any())
+            {
+                return;
+            }
+
+            foreach (var key in keys)
+            {
+                StateManager.Remove(key);
+            }
+
+            await _connection.UnlinkAsync(keys);
         }
 
         /// <inheritdoc />
@@ -256,8 +305,7 @@ namespace Redis.OM.Searching
             query.Limit = new SearchLimit { Number = 1, Offset = 0 };
             var res = await _connection.SearchAsync<T>(query);
             var result = res.Documents.First();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -270,8 +318,7 @@ namespace Redis.OM.Searching
             query.Limit = new SearchLimit { Number = 1, Offset = 0 };
             var res = await _connection.SearchAsync<T>(query);
             var result = res.Documents.First();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -288,8 +335,7 @@ namespace Redis.OM.Searching
             }
 
             var result = res.Documents[key];
-            StateManager.InsertIntoData(key, result);
-            StateManager.InsertIntoSnapshot(key, result);
+            SaveToStateManager(key, result);
             return result;
         }
 
@@ -308,8 +354,7 @@ namespace Redis.OM.Searching
             }
 
             var result = res.Documents[key];
-            StateManager.InsertIntoData(key, result);
-            StateManager.InsertIntoSnapshot(key, result);
+            SaveToStateManager(key, result);
             return result;
         }
 
@@ -326,8 +371,7 @@ namespace Redis.OM.Searching
 
             var key = res.Documents.Keys.Single();
             var result = res.Documents[key];
-            StateManager.InsertIntoData(key, result);
-            StateManager.InsertIntoSnapshot(key, result);
+            SaveToStateManager(key, result);
             return result;
         }
 
@@ -346,8 +390,7 @@ namespace Redis.OM.Searching
 
             var key = res.Documents.Keys.Single();
             var result = res.Documents[key];
-            StateManager.InsertIntoData(key, result);
-            StateManager.InsertIntoSnapshot(key, result);
+            SaveToStateManager(key, result);
             return result;
         }
 
@@ -366,8 +409,7 @@ namespace Redis.OM.Searching
             if (key != default)
             {
                 var result = res.Documents[key];
-                StateManager.InsertIntoData(key, result);
-                StateManager.InsertIntoSnapshot(key, result);
+                SaveToStateManager(key, result);
                 return result;
             }
 
@@ -391,8 +433,7 @@ namespace Redis.OM.Searching
             if (key != null)
             {
                 var result = res.Documents[key];
-                StateManager.InsertIntoData(key, result);
-                StateManager.InsertIntoSnapshot(key, result);
+                SaveToStateManager(key, result);
                 return result;
             }
 
@@ -418,8 +459,7 @@ namespace Redis.OM.Searching
             query.Limit = new SearchLimit { Number = 1, Offset = 0 };
             var res = _connection.Search<T>(query);
             var result = res.Documents.First();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -432,8 +472,7 @@ namespace Redis.OM.Searching
             query.Limit = new SearchLimit { Number = 1, Offset = 0 };
             var res = _connection.Search<T>(query);
             var result = res.Documents.FirstOrDefault();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -451,8 +490,7 @@ namespace Redis.OM.Searching
             }
 
             var result = res.Documents.Single();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -470,8 +508,7 @@ namespace Redis.OM.Searching
             }
 
             var result = res.Documents.SingleOrDefault();
-            StateManager.InsertIntoData(result.Key, result.Value);
-            StateManager.InsertIntoSnapshot(result.Key, result.Value);
+            SaveToStateManager(result.Key, result.Value);
             return result.Value;
         }
 
@@ -479,7 +516,7 @@ namespace Redis.OM.Searching
         public async Task<IDictionary<string, T?>> FindByIdsAsync(IEnumerable<string> ids)
         {
             var tasks = new Dictionary<string, Task<T?>>();
-            foreach (var id in ids)
+            foreach (var id in ids.Distinct())
             {
                 tasks.Add(id, FindByIdAsync(id));
             }
@@ -490,8 +527,7 @@ namespace Redis.OM.Searching
             {
                 if (res.Value != null)
                 {
-                    StateManager.InsertIntoData(res.Value.GetKey(), res.Value);
-                    StateManager.InsertIntoSnapshot(res.Value.GetKey(), res.Value);
+                    SaveToStateManager(res.Value.GetKey(), res.Value);
                 }
             }
 
@@ -600,6 +636,56 @@ namespace Redis.OM.Searching
         }
 
         /// <inheritdoc/>
+        public Task<string?> InsertAsync(T item, WhenKey when, TimeSpan? timeSpan = null)
+        {
+            return ((RedisQueryProvider)Provider).Connection.SetAsync(item, when, timeSpan);
+        }
+
+        /// <inheritdoc/>
+        public string? Insert(T item, WhenKey when, TimeSpan? timeSpan = null)
+        {
+            return ((RedisQueryProvider)Provider).Connection.Set(item, when, timeSpan);
+        }
+
+        /// <inheritdoc/>
+        public async Task<List<string>> Insert(IEnumerable<T> items)
+        {
+            var distinct = items.Distinct().ToArray();
+            if (!distinct.Any())
+            {
+                return new List<string>();
+            }
+
+            var tasks = new List<Task<string>>();
+            foreach (var item in distinct)
+            {
+                tasks.Add(((RedisQueryProvider)Provider).Connection.SetAsync(item));
+            }
+
+            var result = await Task.WhenAll(tasks);
+            return result.ToList();
+        }
+
+        /// <inheritdoc/>
+        public async Task<List<string>> Insert(IEnumerable<T> items, TimeSpan timeSpan)
+        {
+            var distinct = items.Distinct().ToArray();
+            if (!distinct.Any())
+            {
+                return new List<string>();
+            }
+
+            var tasks = new List<Task<string>>();
+            foreach (var item in distinct)
+            {
+                tasks.Add(((RedisQueryProvider)Provider).Connection.SetAsync(item, timeSpan));
+            }
+
+            var result = await Task.WhenAll(tasks);
+            return result.ToList();
+        }
+
+        /// <inheritdoc/>
         public T? FindById(string id)
         {
             var prefix = typeof(T).GetKeyPrefix();
@@ -607,8 +693,7 @@ namespace Redis.OM.Searching
             var result = _connection.Get<T>(key);
             if (result != null)
             {
-                StateManager.InsertIntoData(key, result);
-                StateManager.InsertIntoSnapshot(key, result);
+                SaveToStateManager(key, result);
             }
 
             return result;
@@ -622,8 +707,7 @@ namespace Redis.OM.Searching
             var result = await _connection.GetAsync<T>(key);
             if (result != null)
             {
-                StateManager.InsertIntoData(key, result);
-                StateManager.InsertIntoSnapshot(key, result);
+                SaveToStateManager(key, result);
             }
 
             return result;
@@ -652,6 +736,25 @@ namespace Redis.OM.Searching
             Provider = provider ?? throw new ArgumentNullException(nameof(provider));
             Expression = expression ?? Expression.Constant(this);
             BooleanExpression = booleanExpression;
+        }
+
+        private void SaveToStateManager(string key, object value)
+        {
+            if (SaveState)
+            {
+                try
+                {
+                    StateManager.InsertIntoData(key, value);
+                    StateManager.InsertIntoSnapshot(key, value);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    throw new Exception(
+                        "Exception encountered while trying to save State. This indicates a possible race condition. " +
+                        "If you do not need to update, consider setting SaveState to false, otherwise, ensure collection is only enumerated on one thread at a time",
+                        ex);
+                }
+            }
         }
     }
 }
